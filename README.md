@@ -1,3 +1,5 @@
+![Prepared LoRA dataset — numbered images with caption sidecars](docs/dataset-preview.png)
+
 # lora-dataset-prep
 
 **Turn a folder of raw photos into a clean, captioned, validated LoRA training dataset — in one command.**
