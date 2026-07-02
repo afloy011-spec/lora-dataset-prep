@@ -50,8 +50,8 @@ python prepare_dataset.py --validate-only --output ./my_dataset --trigger mychar
 
 ## What the Script Does
 
-1. Scans the source folder for `.jpg`, `.jpeg`, `.png` images (WebP optional with `--convert-webp`)
-2. Runs image quality checks: dimensions, blur detection, duplicate detection
+1. Scans the source folder for `.jpg`, `.jpeg`, `.png` images (WebP optional with `--convert-webp`; subfolders with `--recursive`)
+2. Runs image quality checks: dimensions, blur detection, EXIF-rotation flags, duplicate detection
 3. Copies (or moves) images into `dataset/train/` with sequential zero-padded names
 4. Optionally resizes images to target resolution (`--resize`)
 5. Writes `.txt` sidecar caption files (template, minimal, VLM, or local auto-captioned)
@@ -89,8 +89,9 @@ my_dataset/
 | `--copy` | yes | Copy files, keep originals |
 | `--move` | no | Move files, delete originals |
 | `--no-backup` | off | Skip raw/ backup |
+| `--recursive` | off | Scan subfolders too (hidden folders skipped; backup names are flattened) |
 | `--convert-webp` | off | Convert .webp to .png (needs Pillow) |
-| `--resize PX` | off | Resize shortest side to PX (e.g. 1024). Needs Pillow |
+| `--resize PX` | off | Resize shortest side to PX (e.g. 1024); bakes EXIF rotation into pixels. Needs Pillow |
 | `--repeats N` | off | Create `N_trigger/` folder instead of `train/` (kohya/Ostris repeats) |
 | `--vlm-model` | `claude-sonnet-4-6` | Model for VLM captioning |
 | `--local-model` | `Salesforce/blip-image-captioning-large` | Model for `local` captioning (use `microsoft/Florence-2-large` for better quality) |
@@ -127,6 +128,7 @@ Runs automatically before processing (disable with `--no-quality-check`):
 | Check | What it detects | Threshold |
 |---|---|---|
 | **Dimensions** | Images smaller than 512px on any side | min 512px |
+| **EXIF rotation** | Phone photos stored rotated with only an EXIF flag (train sideways as-is; `--resize` bakes the rotation in) | orientation ≠ 1 |
 | **Blur** | Blurry/out-of-focus images via edge variance | score < 100 (tune: `--blur-threshold`) |
 | **Exact duplicates** | Identical files by SHA-256 hash | exact match |
 | **Near-duplicates** | Visually similar images via perceptual hash (dHash) | hamming distance <= 10 |

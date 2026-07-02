@@ -607,3 +607,124 @@ class TestValidation:
         warnings = validate_dataset(Path("/nonexistent/train"), "x")
         assert len(warnings) == 1
         assert "does not exist" in warnings[0]
+
+
+class TestTriggerError:
+    def test_valid(self):
+        from prepare_dataset import trigger_error
+        assert trigger_error("mychar01") == ""
+
+    def test_empty(self):
+        from prepare_dataset import trigger_error
+        assert "empty" in trigger_error("").lower()
+
+    def test_braces_rejected(self):
+        # '{'/'}' would crash str.format() on caption templates mid-run
+        from prepare_dataset import trigger_error
+        assert trigger_error("my{char}") != ""
+        assert trigger_error("x}") != ""
+
+
+@pytest.mark.skipif(not HAS_PILLOW, reason="Pillow not installed")
+class TestExifOrientation:
+    def _make_rotated_jpeg(self, path, size=(800, 600), orientation=6):
+        """A landscape-stored JPEG carrying an EXIF 'rotate 90' flag --
+        the way phone cameras store portrait photos."""
+        img = Image.new("RGB", size, "red")
+        exif = Image.Exif()
+        exif[0x0112] = orientation
+        img.save(path, "JPEG", exif=exif)
+
+    def test_resize_bakes_rotation(self, tmp_path):
+        from prepare_dataset import resize_image, exif_orientation
+        src = tmp_path / "phone.jpg"
+        self._make_rotated_jpeg(src, size=(1600, 1200))  # stored landscape
+        dst = tmp_path / "out.jpg"
+        assert resize_image(src, dst, 512) is True
+        with Image.open(dst) as out:
+            w, h = out.size
+            assert h > w  # pixels are now genuinely portrait
+            assert exif_orientation(out) == 1  # flag gone / neutral
+
+    def test_small_rotated_image_resaved(self, tmp_path):
+        # below the resize target, but the rotation must still be baked in
+        from prepare_dataset import resize_image, exif_orientation
+        src = tmp_path / "small.jpg"
+        self._make_rotated_jpeg(src, size=(400, 300))
+        dst = tmp_path / "out.jpg"
+        assert resize_image(src, dst, 1024) is False
+        with Image.open(dst) as out:
+            assert out.size == (300, 400)
+            assert exif_orientation(out) == 1
+
+    def test_small_upright_image_copied_untouched(self, tmp_path):
+        # no rotation, no resize needed -> byte-for-byte copy (no re-encode)
+        from prepare_dataset import resize_image
+        src = tmp_path / "ok.jpg"
+        Image.new("RGB", (400, 300), "red").save(src, "JPEG")
+        dst = tmp_path / "out.jpg"
+        assert resize_image(src, dst, 1024) is False
+        assert dst.read_bytes() == src.read_bytes()
+
+    def test_quality_check_flags_rotation(self, tmp_path):
+        from prepare_dataset import check_images_quality
+        p = tmp_path / "rot.jpg"
+        self._make_rotated_jpeg(p, size=(1024, 768))
+        issues = check_images_quality([p], blur_threshold=0)
+        assert any(path == p for path, _ in issues["exif_rotated"])
+
+    def test_validate_dataset_flags_rotation(self, tmp_path):
+        train = tmp_path / "train"
+        train.mkdir()
+        self._make_rotated_jpeg(train / "01.jpg", size=(1024, 768))
+        (train / "01.txt").write_text(
+            "mychar01, a photograph, medium shot of a man wearing a coat, "
+            "standing outdoors, neutral expression, street background, daylight",
+            encoding="utf-8")
+        warnings = validate_dataset(train, "mychar01", blur_threshold=0)
+        assert any("EXIF rotation" in w for w in warnings)
+
+
+@pytest.mark.skipif(not HAS_PILLOW, reason="Pillow not installed")
+class TestDiscoverRecursive:
+    def _make_image(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (64, 64), "red").save(path)
+
+    def test_non_recursive_ignores_subfolders(self, tmp_path):
+        from prepare_dataset import discover_images
+        self._make_image(tmp_path / "a.png")
+        self._make_image(tmp_path / "sub" / "b.png")
+        found = discover_images(tmp_path)
+        assert [f.name for f in found["supported"]] == ["a.png"]
+
+    def test_recursive_finds_subfolders(self, tmp_path):
+        from prepare_dataset import discover_images
+        self._make_image(tmp_path / "a.png")
+        self._make_image(tmp_path / "sub" / "b.png")
+        found = discover_images(tmp_path, recursive=True)
+        assert sorted(f.name for f in found["supported"]) == ["a.png", "b.png"]
+
+    def test_recursive_skips_hidden_dirs(self, tmp_path):
+        from prepare_dataset import discover_images
+        self._make_image(tmp_path / "a.png")
+        self._make_image(tmp_path / ".cache" / "junk.png")
+        found = discover_images(tmp_path, recursive=True)
+        assert [f.name for f in found["supported"]] == ["a.png"]
+
+
+@pytest.mark.skipif(not HAS_PILLOW, reason="Pillow not installed")
+class TestTriggerWarningDedup:
+    def test_missing_trigger_warns_once(self, tmp_path):
+        # a caption with no trigger at all gets ONE warning, not
+        # "missing" + "does not start with" stacked
+        train = tmp_path / "train"
+        train.mkdir()
+        Image.new("RGB", (1024, 1024), "red").save(train / "01.png")
+        (train / "01.txt").write_text(
+            "a photograph, medium shot of a man wearing a coat, standing "
+            "outdoors, neutral expression, street background, daylight",
+            encoding="utf-8")
+        warnings = validate_dataset(train, "mychar01", blur_threshold=0)
+        trigger_warnings = [w for w in warnings if "rigger token" in w]
+        assert len(trigger_warnings) == 1

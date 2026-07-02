@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-prepare_dataset.py v2.2.0
+prepare_dataset.py v2.3.0
 LoRA dataset preparation tool -- Ostris AI Toolkit / Z-Image Turbo
 
 Prepares raw images into a clean numbered dataset with .txt caption sidecars,
@@ -44,7 +44,7 @@ from datetime import datetime
 from pathlib import Path
 
 # -- Version --------------------------------------------------------------------
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 
 # -- Supported formats ----------------------------------------------------------
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png"}
@@ -263,6 +263,35 @@ def word_count(text: str) -> int:
     return len(text.split())
 
 
+def trigger_error(trigger: str) -> str:
+    """A blocking problem with the trigger token, or "" when it is usable.
+
+    Braces are a hard error: the trigger is inserted into caption templates and
+    VLM prompts via str.format(), so '{' / '}' would crash mid-run. Everything
+    else merely warns (see main()).
+    """
+    if not trigger:
+        return "Trigger token cannot be empty."
+    if "{" in trigger or "}" in trigger:
+        return "Trigger token must not contain '{' or '}' (it is inserted into caption templates)."
+    return ""
+
+
+def vlm_auth_error() -> str:
+    """Empty string if the Anthropic client can resolve credentials.
+
+    Constructing the client resolves ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN /
+    a CLI login profile — without this early check a missing key fails once per
+    image with a cryptic per-request error instead of one clear message.
+    """
+    try:
+        import anthropic
+        anthropic.Anthropic()
+        return ""
+    except Exception as e:
+        return str(e)
+
+
 # -- Image quality helpers ------------------------------------------------------
 
 def get_image_dimensions(path: Path) -> tuple:
@@ -340,8 +369,19 @@ def find_near_duplicates(images: list, threshold: int = NEAR_DUPE_THRESHOLD) -> 
     return pairs
 
 
+def exif_orientation(img) -> int:
+    """The EXIF orientation tag (1 = upright). Phone photos are often stored
+    rotated with only this flag set; training pipelines read raw pixels and
+    ignore it, so such images would train sideways."""
+    try:
+        return int(img.getexif().get(0x0112) or 1)
+    except Exception:
+        return 1
+
+
 def check_images_quality(images: list, blur_threshold: float = BLUR_THRESHOLD) -> dict:
-    issues = {"too_small": [], "blurry": [], "exact_duplicates": [], "near_duplicates": []}
+    issues = {"too_small": [], "blurry": [], "exif_rotated": [],
+              "exact_duplicates": [], "near_duplicates": []}
 
     pillow_ok = has_pillow()
 
@@ -351,6 +391,14 @@ def check_images_quality(images: list, blur_threshold: float = BLUR_THRESHOLD) -
                 w, h = get_image_dimensions(img_path)
                 if w < MIN_IMAGE_DIM or h < MIN_IMAGE_DIM:
                     issues["too_small"].append((img_path, w, h))
+            except Exception:
+                pass
+            try:
+                from PIL import Image
+                with Image.open(img_path) as img:
+                    orientation = exif_orientation(img)
+                if orientation != 1:
+                    issues["exif_rotated"].append((img_path, orientation))
             except Exception:
                 pass
             if blur_threshold > 0:
@@ -369,17 +417,30 @@ def check_images_quality(images: list, blur_threshold: float = BLUR_THRESHOLD) -
 # -- Image processing -----------------------------------------------------------
 
 def convert_webp_to_png(src: Path, dst: Path) -> None:
-    from PIL import Image
+    from PIL import Image, ImageOps
     with Image.open(src) as img:
-        img.save(dst, "PNG")
+        # bake the EXIF orientation into the pixels (lossless: output is PNG)
+        ImageOps.exif_transpose(img).save(dst, "PNG")
 
 
 def resize_image(src: Path, dst: Path, target_size: int) -> bool:
-    from PIL import Image
+    from PIL import Image, ImageOps
     with Image.open(src) as img:
-        w, h = img.size
+        # Bake the EXIF orientation into the pixels BEFORE measuring/resizing:
+        # trainers read raw pixels, so an EXIF-only rotation trains sideways.
+        # Only re-encode when a rotation was actually applied — a plain copy
+        # keeps the original bytes (no generation loss).
+        needs_transpose = exif_orientation(img) != 1
+        oriented = ImageOps.exif_transpose(img) if needs_transpose else img
+        w, h = oriented.size
+        fmt = "PNG" if dst.suffix.lower() == ".png" else "JPEG"
+        save_kwargs = {"quality": 95} if fmt == "JPEG" else {}
         if min(w, h) <= target_size:
-            if src != dst:
+            if needs_transpose:
+                if fmt == "JPEG":
+                    oriented = oriented.convert("RGB")
+                oriented.save(dst, fmt, **save_kwargs)
+            elif src != dst:
                 shutil.copy2(src, dst)
             return False
         if w < h:
@@ -388,9 +449,9 @@ def resize_image(src: Path, dst: Path, target_size: int) -> bool:
         else:
             new_h = target_size
             new_w = int(w * target_size / h)
-        resized = img.resize((new_w, new_h), Image.LANCZOS)
-        fmt = "PNG" if dst.suffix.lower() == ".png" else "JPEG"
-        save_kwargs = {"quality": 95} if fmt == "JPEG" else {}
+        resized = oriented.resize((new_w, new_h), Image.LANCZOS)
+        if fmt == "JPEG":
+            resized = resized.convert("RGB")
         resized.save(dst, fmt, **save_kwargs)
         return True
 
@@ -571,10 +632,14 @@ def caption_batch_local(ops: list, lora_type: str, trigger: str,
 
 # -- Source discovery -----------------------------------------------------------
 
-def discover_images(source_dir: Path) -> dict:
+def discover_images(source_dir: Path, recursive: bool = False) -> dict:
     result = {"supported": [], "webp": [], "unsupported": [], "all": []}
-    for f in sorted(source_dir.iterdir()):
+    files = sorted(source_dir.rglob("*")) if recursive else sorted(source_dir.iterdir())
+    for f in files:
         if not f.is_file():
+            continue
+        # skip hidden dirs/files (.git, .cache, .DS_Store …) in recursive mode
+        if recursive and any(part.startswith(".") for part in f.relative_to(source_dir).parts):
             continue
         ext = f.suffix.lower()
         if ext in SUPPORTED_EXTS:
@@ -672,6 +737,9 @@ def print_plan(ops: list, opts: dict, quality: dict = None) -> None:
             print("  IMAGE QUALITY WARNINGS:")
             for path, w, h in quality["too_small"]:
                 print(f"    SMALL  {path.name} ({w}x{h} -- min {MIN_IMAGE_DIM}px)")
+            for path, orientation in quality.get("exif_rotated", []):
+                fix = "will be fixed by --resize" if opts.get("resize") else "pass --resize to bake the rotation in"
+                print(f"    EXIF   {path.name} (orientation flag {orientation} -- trains sideways as-is; {fix})")
             for path, score in quality["blurry"]:
                 print(f"    BLUR   {path.name} (score {score} -- threshold {BLUR_THRESHOLD})")
             for group in quality["exact_duplicates"]:
@@ -693,6 +761,14 @@ def print_plan(ops: list, opts: dict, quality: dict = None) -> None:
     print(f"  metadata.json  will be created")
     if opts["backup"]:
         print(f"  raw/           originals will be copied")
+    if opts["move"]:
+        print()
+        if opts["backup"]:
+            print("  NOTE: --move DELETES the originals from the source folder")
+            print("        after processing (raw/ keeps a backup copy).")
+        else:
+            print("  NOTE: --move + --no-backup PERMANENTLY deletes the originals")
+            print("        from the source folder. No copy will remain.")
     print()
     print("  To apply: run again with --execute")
     print("=" * 60)
@@ -760,7 +836,15 @@ def execute_plan(ops: list, opts: dict) -> dict:
     for op in ops:
         try:
             if opts["backup"]:
-                shutil.copy2(op["src"], raw_dir / op["src"].name)
+                # flatten subfolder paths into the backup name so two files with
+                # the same basename (possible with --recursive) can't collide
+                src_root = opts.get("source_dir")
+                try:
+                    rel = op["src"].resolve().relative_to(src_root.resolve()) if src_root else None
+                except (ValueError, OSError):
+                    rel = None
+                backup_name = "__".join(rel.parts) if rel else op["src"].name
+                shutil.copy2(op["src"], raw_dir / backup_name)
 
             # -- Image processing --
             was_resized = False
@@ -1077,7 +1161,9 @@ def validate_dataset(train_dir: Path, trigger: str, run_quality: bool = True,
             continue
         if trigger and trigger.lower() not in text.lower():
             warnings.append(f"Trigger token '{trigger}' missing in: {base}.txt")
-        if not text.lower().startswith(trigger.lower()):
+        elif not text.lower().startswith(trigger.lower()):
+            # elif: a caption with no trigger at all already got the warning
+            # above — flagging "does not start with" on top of it is noise
             warnings.append(f"Caption does not start with trigger token '{trigger}': {base}.txt")
         wc = word_count(text)
         if wc > CAPTION_WORD_LONG:
@@ -1126,6 +1212,14 @@ def validate_dataset(train_dir: Path, trigger: str, run_quality: bool = True,
                 w, h = get_image_dimensions(img_path)
                 if w < MIN_IMAGE_DIM or h < MIN_IMAGE_DIM:
                     warnings.append(f"Image too small ({w}x{h}, min {MIN_IMAGE_DIM}px): {img_path.name}")
+            except Exception:
+                pass
+            try:
+                from PIL import Image
+                with Image.open(img_path) as img:
+                    orientation = exif_orientation(img)
+                if orientation != 1:
+                    warnings.append(f"EXIF rotation flag set (trains sideways -- re-run with --resize): {img_path.name}")
             except Exception:
                 pass
             if blur_threshold > 0:
@@ -1252,6 +1346,10 @@ def parse_args() -> dict:
                               help="Move images (deletes originals after copy)")
     parser.add_argument("--no-backup", action="store_true", default=False,
                         help="Skip creating raw/ backup folder")
+    parser.add_argument("--recursive", action="store_true", default=False,
+                        help="Scan the source folder recursively (include subfolders; "
+                             "hidden folders are skipped). Do not nest the output "
+                             "folder inside the source")
     parser.add_argument("--convert-webp", action="store_true", default=False,
                         help="Convert WebP images to PNG (requires Pillow)")
     parser.add_argument("--resize", type=int, default=None, metavar="PX",
@@ -1288,6 +1386,7 @@ def parse_args() -> dict:
         # mode can ask; main() falls back to copy/backup defaults otherwise.
         "move": True if args.move else (False if args.copy else None),
         "backup": False if args.no_backup else None,
+        "recursive": args.recursive,
         "convert_webp": args.convert_webp,
         "resize": args.resize,
         "repeats": args.repeats,
@@ -1406,6 +1505,18 @@ def main() -> int:
         print("  Set ANTHROPIC_API_KEY environment variable.")
         return 1
 
+    if opts["captions"] == "vlm":
+        auth_err = vlm_auth_error()
+        if auth_err:
+            # Fail fast on --execute: without this, every image fails one by
+            # one with a cryptic per-request auth error. A dry-run may be
+            # planned on a machine without the key, so it only warns.
+            if opts["execute"]:
+                print(f"\nERROR: VLM captioning cannot authenticate: {auth_err}")
+                print("  Set ANTHROPIC_API_KEY (or log in via `ant auth login`) and re-run.")
+                return 1
+            print(f"\nWARNING: Anthropic credentials not found -- --execute will fail: {auth_err}")
+
     if opts["captions"] == "local" and not has_local_vlm_support():
         print("\nERROR: Local captioning requires transformers and torch.")
         print("  Install with: pip install transformers torch")
@@ -1428,16 +1539,23 @@ def main() -> int:
 
     # -- Validate trigger token --
     trigger = opts["trigger"]
-    if not trigger:
-        print("\nERROR: Trigger token cannot be empty.")
+    err = trigger_error(trigger)
+    if err:
+        print(f"\nERROR: {err}")
         return 1
     if not re.match(r'^[a-zA-Z0-9_-]+$', trigger):
         print(f"\nWARNING: Trigger token '{trigger}' contains special characters. "
               "Recommended: lowercase letters + numbers only (e.g. mychar01).")
 
     # -- Discover images --
-    print(f"\nScanning: {source_dir}")
-    found = discover_images(source_dir)
+    recursive = bool(opts.get("recursive"))
+    print(f"\nScanning: {source_dir}" + (" (recursive)" if recursive else ""))
+    found = discover_images(source_dir, recursive=recursive)
+
+    if not recursive:
+        subdirs = [d for d in source_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+        if subdirs:
+            print(f"  NOTE: {len(subdirs)} subfolder(s) ignored -- pass --recursive to include them")
 
     if not found["all"]:
         print("ERROR: No image files found in source folder.")
@@ -1477,11 +1595,15 @@ def main() -> int:
         print("  Running quality checks...")
         quality = check_images_quality(images_to_process,
                                        blur_threshold=opts.get("blur_threshold", BLUR_THRESHOLD))
-        has_issues = (quality["too_small"] or quality["blurry"]
+        has_issues = (quality["too_small"] or quality["blurry"] or quality.get("exif_rotated")
                       or quality["exact_duplicates"] or quality["near_duplicates"])
         if has_issues:
             if quality["too_small"]:
                 print(f"  WARNING: {len(quality['too_small'])} images below {MIN_IMAGE_DIM}px")
+            if quality.get("exif_rotated"):
+                n = len(quality["exif_rotated"])
+                hint = "" if opts.get("resize") else " -- add --resize to bake the rotation into the pixels"
+                print(f"  WARNING: {n} images carry an EXIF rotation flag (train sideways as-is){hint}")
             if quality["blurry"]:
                 print(f"  WARNING: {len(quality['blurry'])} images may be blurry")
             if quality["exact_duplicates"]:

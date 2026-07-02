@@ -6,7 +6,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.8+-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-2ea44f?style=flat-square)](LICENSE)
-[![Tests](https://img.shields.io/badge/Tests-67_passing-2ea44f?style=flat-square)](test_prepare_dataset.py)
+[![Tests](https://github.com/afloy011-spec/lora-dataset-prep/actions/workflows/test.yml/badge.svg)](https://github.com/afloy011-spec/lora-dataset-prep/actions/workflows/test.yml)
 [![Agent Skill](https://img.shields.io/badge/Agent_Skill-Claude_Code_·_Cursor-5A45FF?style=flat-square)](SKILL.md)
 
 [Quick start](#quick-start) · [How it works](#how-it-works) · [Captioning](#the-captioning-rule) · [Validation](#what-gets-validated) · [Agent skill](#use-as-an-agent-skill) · [Reference](reference.md)
@@ -59,8 +59,8 @@ Prefer questions over flags? Just run `python prepare_dataset.py`.
 
 | Stage | What happens |
 |:--|:--|
-| **1 · Scan** | Finds `.jpg` / `.jpeg` / `.png` (WebP via `--convert-webp`), skips junk |
-| **2 · Quality gate** | Flags small images, blur, exact duplicates (SHA-256), near-duplicates (perceptual dHash) |
+| **1 · Scan** | Finds `.jpg` / `.jpeg` / `.png` (WebP via `--convert-webp`; subfolders via `--recursive`), skips junk |
+| **2 · Quality gate** | Flags small images, blur, EXIF-rotated phone photos, exact duplicates (SHA-256), near-duplicates (perceptual dHash) |
 | **3 · Organize** | Sequential zero-padded names, originals backed up to `raw/` |
 | **4 · Caption** | Writes a `.txt` sidecar per image — four modes, see below |
 | **5 · Validate** | 20+ checks on the finished dataset |
@@ -116,7 +116,9 @@ failed-VLM markers
 flagged; the silent killer that bakes one lighting or gaze into every generation
 
 **Images** — minimum dimensions, blur heuristic (tunable via
-`--blur-threshold`, `0` disables), exact and near-duplicate detection
+`--blur-threshold`, `0` disables), EXIF rotation flags (phone photos that
+would train sideways — `--resize` bakes the rotation into the pixels),
+exact and near-duplicate detection
 
 <br>
 
@@ -141,7 +143,8 @@ The agent reads [SKILL.md](SKILL.md) for the workflow and
 |:--|:--|
 | `--type` | `character` · `style` · `object` · `clothing` · `environment` |
 | `--captions` | `template` · `minimal` · `vlm` · `local` |
-| `--resize 1024` | Shortest side to 1024 px; aspect preserved; never upscales |
+| `--resize 1024` | Shortest side to 1024 px; aspect preserved; never upscales; bakes EXIF rotation into pixels |
+| `--recursive` | Include subfolders when scanning the source (hidden folders skipped) |
 | `--repeats 10` | kohya-style `10_trigger/` folder naming |
 | `--convert-webp` | WebP → PNG (many trainers can't read WebP) |
 | `--blur-threshold 50` | Blur sensitivity; `0` disables |
@@ -156,12 +159,14 @@ Complete table: [SKILL.md → Options Reference](SKILL.md#options-reference).
 
 ```bash
 pip install pytest Pillow
-python -m pytest test_prepare_dataset.py -q        # 67 tests, ~1 s
+python -m pytest test_prepare_dataset.py -q        # 79 tests, ~3 s
 ```
 
 The suite covers caption generation, hashing, perceptual dedupe, resize,
-every validation rule, attribute-sticking detection, and the VLM path
-(mocked API — no key needed).
+EXIF-orientation handling, every validation rule, attribute-sticking
+detection, and the VLM path (mocked API — no key needed). CI runs the same
+suite on Python 3.9–3.12 for every push; releases are tagged and summarised
+in [CHANGELOG.md](CHANGELOG.md).
 
 ```text
 lora-dataset-prep/
